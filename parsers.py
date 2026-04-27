@@ -9,6 +9,10 @@ class Transaction:
         self.payee = payee
         self.memo = memo
         self.num = num
+        self.splits = [] # List of (memo, amount)
+
+    def add_split(self, memo, amount):
+        self.splits.append((memo, amount))
 
     def to_qif(self):
         date_str = self.date.strftime("%d/%m/%y")
@@ -17,13 +21,28 @@ class Transaction:
         lines = [f"D{date_str}", f"T{amount_val:.2f}", f"P{self.payee}"]
         if self.num is not None: lines.append(f"N{self.num}")
         if self.memo: lines.append(f"M{self.memo}")
+        
+        for s_memo, s_amount in self.splits:
+            lines.append(f"S{s_memo}")
+            lines.append(f"${s_amount:.2f}")
+
         lines.append("^")
         return "\n".join(lines)
 
     def to_csv_row(self):
         date_str = self.date.strftime("%Y-%m-%d")
         amount_val = self.amount if abs(self.amount) > 0.005 else 0.0
-        return [date_str, f"{amount_val:.2f}", self.payee, self.memo or "", self.num or ""]
+        # For CSV, we'll just include the total amount. 
+        # Alternatively, we could include split info in memo.
+        memo_with_splits = self.memo or ""
+        if self.splits:
+            split_info = "; ".join([f"{m}: {a:.2f}" for m, a in self.splits])
+            if memo_with_splits:
+                memo_with_splits += f" (Splits: {split_info})"
+            else:
+                memo_with_splits = f"Splits: {split_info}"
+        
+        return [date_str, f"{amount_val:.2f}", self.payee, memo_with_splits, self.num or ""]
 
 class BaseParser:
     def __init__(self, filename):
@@ -74,23 +93,45 @@ class NABBankAccountParser(BaseParser):
                                 elif abs((prev_balance - amount) - balance) < 0.01:
                                     amount = -amount
                             prev_balance = balance
-                            transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
+                            t = Transaction(current_date, amount, particulars.strip().rstrip('.'))
+                            transactions.append(t)
                         else:
                             # Only one amount, could be transaction or balance.
-                            # In NAB, if it's the only amount on a dated line, it's usually the transaction amount if followed by balance lines,
-                            # or it could be a balance if it's a "Brought forward" (already handled).
-                            # Let's assume it's a transaction amount for now.
                             amount = float(amt1.replace(',', ''))
-                            transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
+                            t = Transaction(current_date, amount, particulars.strip().rstrip('.'))
+                            transactions.append(t)
                         continue
 
-                    # Match line without date but with amount
+                    # Match line without date but with amount (could be a multi-line part of transaction OR a fee)
                     match_no_date = re.search(r'^([\s\S]*?)\s+([\d,]+\.\d{2})(?:\s+([\d,]+\.\d{2}))?(?:\s+(Cr|Dr))?$', line)
                     if match_no_date and current_date:
                         particulars, amt1, amt2, suffix = match_no_date.groups()
-                        if len(particulars.strip()) > 3 and not particulars.strip().startswith("Statement") and not particulars.strip().startswith("Carried"):
+                        part_strip = particulars.strip().rstrip('.')
+                        
+                        # Check if it looks like a fee and we have a previous transaction to attach to
+                        if transactions and ("Fee" in part_strip or "Charge" in part_strip):
+                            amount = float(amt1.replace(',', ''))
+                            # For NAB Bank, fees are usually debits (negative)
+                            # We can try to use balance if available to be sure
                             if amt2:
-                                amount = float(amt1.replace(',', ''))
+                                balance = float(amt2.replace(',', ''))
+                                if prev_balance is not None:
+                                    if abs((prev_balance - amount) - balance) < 0.01:
+                                        amount = -amount
+                                prev_balance = balance
+                            else:
+                                # Default to negative for fees in bank account if not sure
+                                amount = -abs(amount)
+                                
+                            transactions[-1].add_split(part_strip, amount)
+                            # Update total amount of the transaction to include the fee?
+                            # In QIF, the T amount is usually the TOTAL of all splits.
+                            transactions[-1].amount += amount
+                            continue
+
+                        if len(particulars.strip()) > 3 and not particulars.strip().startswith("Statement") and not particulars.strip().startswith("Carried"):
+                            amount = float(amt1.replace(',', ''))
+                            if amt2:
                                 balance = float(amt2.replace(',', ''))
                                 if prev_balance is not None:
                                     if abs((prev_balance + amount) - balance) < 0.01:
@@ -98,10 +139,13 @@ class NABBankAccountParser(BaseParser):
                                     elif abs((prev_balance - amount) - balance) < 0.01:
                                         amount = -amount
                                 prev_balance = balance
-                                transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
                             else:
-                                amount = float(amt1.replace(',', ''))
-                                transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
+                                # For NAB, if it's the second line of a transaction, it might be a debit
+                                # BUT we only want to assume debit if it's not a credit.
+                                # Let's stick to the safer logic for now or improve it.
+                                pass
+                            
+                            transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
 
         return transactions
 
@@ -148,9 +192,34 @@ class ANZCreditCardParser(BaseParser):
                             amount = -amount
                             
                         transactions.append(Transaction(date, amount, details.strip()))
+                        continue
+
+                    # Match fee lines that follow a transaction
+                    # Example: 05/10/2020 INCL OVERSEAS TXN FEE 0.09 AUD $8,974.24
+                    # Note: These lines have only ONE date (processed date)
+                    match_fee = re.search(r'(\d{2}/\d{2}/\d{4})\s+(INCL OVERSEAS TXN FEE\s+([\d,]+\.\d{2})\s+AUD)', line)
+                    if match_fee and transactions:
+                        date_str, fee_details, fee_amount_str = match_fee.groups()
+                        fee_amount = float(fee_amount_str.replace(',', ''))
+                        # For credit cards, fees are usually part of the previous transaction's total on the statement?
+                        # Wait, let's look at the ANZ statement again.
+                        # 05/10/2020 01/10/2020 2586 PAYPAL *PATREON MEMBER 4029357733 $3.02 $8,974.24
+                        # 05/10/2020 INCL OVERSEAS TXN FEE 0.09 AUD $8,974.24
+                        # The balance is the SAME ($8,974.24). This means the $3.02 ALREADY INCLUDES the $0.09 fee.
+                        # So we should split the $3.02 into $2.93 and $0.09 fee.
+                        
+                        # Update the base amount of the last transaction
+                        transactions[-1].amount += fee_amount # amount was negative, adding fee_amount (which should be treated as negative)
+                        # Actually if amount is -3.02 and fee is 0.09, we want base -2.93 and fee -0.09.
+                        # So base = -3.02 - (-0.09) = -2.93.
+                        # But wait, fee_amount is extracted as positive 0.09.
+                        
+                        transactions[-1].amount += fee_amount # -3.02 + 0.09 = -2.93
+                        transactions[-1].add_split(fee_details, -fee_amount)
+                        continue
                     
                     # Also match "INTEREST CHARGED" or other lines that might have slightly different format
-                    elif "INTEREST CHARGED" in line:
+                    if "INTEREST CHARGED" in line:
                         match_int = re.search(r'(\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}/\d{4}\s+([\s\S]*?)\s+\$([\d,]+\.\d{2})', line)
                         if match_int:
                             date_str, details, amount_str = match_int.groups()

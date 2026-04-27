@@ -13,7 +13,7 @@ A Python-based utility to convert bank statements in PDF format into QIF (Quicke
 - **Multi-format Support**: Export transactions to either QIF or CSV.
 - **Batch Processing**: Process multiple statement files of the same type and aggregate them into a single output file.
 - **Auto-detection**: Automatically detects the output format based on the file extension (`.qif` or `.csv`).
-- **Robust Extraction**: Uses `pdfplumber` and regex-based parsing to handle multi-line transactions and complex PDF layouts.
+- **Robust Extraction**: Uses `pdfplumber` and regex-based parsing to handle multi-line transactions, complex PDF layouts, and transaction fees (converted to QIF splits).
 - **Security Focused**: Implements path validation to prevent unauthorized system access and uses secure coding practices.
 
 ## Installation
