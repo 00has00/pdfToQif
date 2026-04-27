@@ -1,6 +1,7 @@
 /sample-statements/
 /sample-qif-files/
 /.venv/
+/.idea/
 /*.txt
 /*.csv
 /*.qif
