@@ -57,96 +57,199 @@ class NABBankAccountParser(BaseParser):
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text: continue
+                
+                # Use words to get X positions for better accuracy
+                words = page.extract_words()
+                
                 lines = text.split('\n')
                 current_date = None
+                in_transactions = False
+                
                 for line in lines:
+                    line = line.strip()
+                    if not line: continue
+                    
                     if "Opening balance" in line:
                         match = re.search(r'Opening balance \$([\d,]+\.\d{2})', line)
                         if match:
                             prev_balance = float(match.group(1).replace(',', ''))
                         continue
                     
-                    if "Brought forward" in line:
+                    if "Transaction Details" in line:
+                        in_transactions = True
+                        continue
+                    
+                    if not in_transactions: continue
+                    
+                    # Look for date
+                    date_match = re.match(r'^(\d{1,2} [A-Z][a-z]{2} \d{4})', line)
+                    if date_match:
+                        current_date = datetime.strptime(date_match.group(1), "%d %b %Y")
+                        line = line[len(date_match.group(1)):].strip()
+
+                    if not current_date: continue
+                    if "Carried forward" in line: continue
+                    if "Brought forward" in line and "Particulars" not in line:
                         match = re.search(r'Brought forward\s+([\d,]+\.\d{2})', line)
                         if match:
                             prev_balance = float(match.group(1).replace(',', ''))
                         continue
 
-                    # Match line with date
-                    match = re.search(r'^(\d{1,2} [A-Z][a-z]{2} \d{4})\s+([\s\S]*?)(?:\s+([\d,]+\.\d{2}))(?:\s+([\d,]+\.\d{2}))?(?:\s+(Cr|Dr))?$', line)
-                    if match:
-                        date_str, particulars, amt1, amt2, suffix = match.groups()
-                        current_date = datetime.strptime(date_str, "%d %b %Y")
+                    amt_matches = re.findall(r'([\d,]+\.\d{2})', line)
+                    if not amt_matches: continue
+                    
+                    # For each amount, find its X position to determine if it's Debit, Credit, or Balance
+                    amounts_with_x = []
+                    # We need to find the word in the words list that matches this amount and is on this line?
+                    # Searching by text is okay as long as we are careful.
+                    for amt_str in amt_matches:
+                         # Find word with this text. We might have multiple.
+                         # Let's just find the one that hasn't been used yet on this page?
+                         # Or simpler: just use the regex to find the transaction part.
+                         pass
+                    
+                    # Actually, let's use the balance change logic first, it's more general if we have balances.
+                    # But we only have balances on some lines.
+                    
+                    first_amt_pos = line.find(amt_matches[0])
+                    particulars = line[:first_amt_pos].strip()
+                    
+                    if len(amt_matches) >= 2:
+                        amount = float(amt_matches[-2].replace(',', ''))
+                        balance = float(amt_matches[-1].replace(',', ''))
                         
-                        if "Brought forward" in particulars:
-                            prev_balance = float(amt1.replace(',', ''))
-                            continue
-
-                        # If two amounts, amt2 is balance. amt1 is transaction.
-                        if amt2:
-                            amount = float(amt1.replace(',', ''))
-                            balance = float(amt2.replace(',', ''))
-                            # Determine sign by balance change
-                            if prev_balance is not None:
-                                if abs((prev_balance + amount) - balance) < 0.01:
-                                    pass # positive
-                                elif abs((prev_balance - amount) - balance) < 0.01:
+                        if prev_balance is not None:
+                            if abs((prev_balance + amount) - balance) < 0.01:
+                                pass # positive
+                            elif abs((prev_balance - amount) - balance) < 0.01:
+                                amount = -amount
+                            else:
+                                if abs((prev_balance - amount) - balance) < abs((prev_balance + amount) - balance):
                                     amount = -amount
-                            prev_balance = balance
-                            t = Transaction(current_date, amount, particulars.strip().rstrip('.'))
-                            transactions.append(t)
-                        else:
-                            # Only one amount, could be transaction or balance.
-                            amount = float(amt1.replace(',', ''))
-                            t = Transaction(current_date, amount, particulars.strip().rstrip('.'))
-                            transactions.append(t)
-                        continue
-
-                    # Match line without date but with amount (could be a multi-line part of transaction OR a fee)
-                    match_no_date = re.search(r'^([\s\S]*?)\s+([\d,]+\.\d{2})(?:\s+([\d,]+\.\d{2}))?(?:\s+(Cr|Dr))?$', line)
-                    if match_no_date and current_date:
-                        particulars, amt1, amt2, suffix = match_no_date.groups()
-                        part_strip = particulars.strip().rstrip('.')
                         
-                        # Check if it looks like a fee and we have a previous transaction to attach to
-                        if transactions and ("Fee" in part_strip or "Charge" in part_strip):
-                            amount = float(amt1.replace(',', ''))
-                            # For NAB Bank, fees are usually debits (negative)
-                            # We can try to use balance if available to be sure
-                            if amt2:
-                                balance = float(amt2.replace(',', ''))
-                                if prev_balance is not None:
-                                    if abs((prev_balance - amount) - balance) < 0.01:
-                                        amount = -amount
-                                prev_balance = balance
+                        prev_balance = balance
+                        transactions.append(Transaction(current_date, amount, particulars))
+                    elif len(amt_matches) == 1:
+                        amount = float(amt_matches[0].replace(',', ''))
+                        # For NAB, we can use the "guess by particulars" then verify when next balance comes.
+                        # OR, since I saw the X positions, I'll use a hack: check if the amount is shifted right.
+                        # But I don't have X positions here easily without re-parsing.
+                        
+                        # Let's try balance tracking with a "pending" list.
+                        if "Brought forward" in particulars or "Carried forward" in particulars:
+                            prev_balance = float(amt_matches[0].replace(',', ''))
+                        else:
+                            # Default to negative for now, but we'll fix it if it fails balance check?
+                            # Actually, most transactions are debits.
+                            if "Fee" in particulars or "Charge" in particulars:
+                                amount = -amount
+                            elif "Payroll" in particulars or "Interest" in particulars or "Benefit" in particulars or "Rebate" in particulars:
+                                pass # keep positive
                             else:
-                                # Default to negative for fees in bank account if not sure
-                                amount = -abs(amount)
+                                # Guess debit for now. 
+                                # Wait, I'll just use the X-position hack by looking at the line's length or something?
+                                # No, let's use the X0 from words.
                                 
-                            transactions[-1].add_split(part_strip, amount)
-                            # Update total amount of the transaction to include the fee?
-                            # In QIF, the T amount is usually the TOTAL of all splits.
-                            transactions[-1].amount += amount
-                            continue
+                                # FIND X0 for this amount
+                                amt_x0 = 0
+                                for word in words:
+                                     if word['text'] == amt_matches[0]:
+                                          # Check if it's roughly on the same line (this is hard)
+                                          # Let's just use the first one we find that is > previous found word
+                                          amt_x0 = word['x0']
+                                          # If there are multiple, this is risky.
+                                          # But usually amounts are unique enough on a page? No.
+                                          
+                                # OK, forget X0 for now. Let's use the "Buffer" logic.
+                                transactions.append(Transaction(current_date, amount, particulars))
+                                # We'll fix the sign of the LAST transaction when we see a balance on the NEXT line.
+        
+        # Post-process to fix signs using balance tracking
+        fixed_transactions = []
+        pb = None
+        # Find initial balance
+        with pdfplumber.open(self.filename) as pdf:
+             for page in pdf.pages:
+                  text = page.extract_text()
+                  m = re.search(r'Opening balance \$([\d,]+\.\d{2})', text)
+                  if m:
+                       pb = float(m.group(1).replace(',', ''))
+                       break
+        
+        # We need to re-parse and keep track of when we see balances.
+        # This is getting complicated. Let's try the X position properly.
+        return self._parse_with_x()
 
-                        if len(particulars.strip()) > 3 and not particulars.strip().startswith("Statement") and not particulars.strip().startswith("Carried"):
-                            amount = float(amt1.replace(',', ''))
-                            if amt2:
-                                balance = float(amt2.replace(',', ''))
-                                if prev_balance is not None:
-                                    if abs((prev_balance + amount) - balance) < 0.01:
-                                        pass
-                                    elif abs((prev_balance - amount) - balance) < 0.01:
-                                        amount = -amount
-                                prev_balance = balance
-                            else:
-                                # For NAB, if it's the second line of a transaction, it might be a debit
-                                # BUT we only want to assume debit if it's not a credit.
-                                # Let's stick to the safer logic for now or improve it.
-                                pass
-                            
-                            transactions.append(Transaction(current_date, amount, particulars.strip().rstrip('.')))
-
+    def _parse_with_x(self):
+        transactions = []
+        with pdfplumber.open(self.filename) as pdf:
+            prev_balance = None
+            for page in pdf.pages:
+                words = page.extract_words()
+                current_date = None
+                in_transactions = False
+                
+                # Group words into lines
+                lines_words = []
+                if not words: continue
+                current_line_y = words[0]['top']
+                current_line = []
+                for w in words:
+                    if abs(w['top'] - current_line_y) > 3:
+                        lines_words.append(current_line)
+                        current_line = []
+                        current_line_y = w['top']
+                    current_line.append(w)
+                lines_words.append(current_line)
+                
+                for line_w in lines_words:
+                    line_text = " ".join([w['text'] for w in line_w])
+                    
+                    if "Opening balance" in line_text:
+                        m = re.search(r'Opening balance \$([\d,]+\.\d{2})', line_text)
+                        if m: prev_balance = float(m.group(1).replace(',', ''))
+                        continue
+                    if "Transaction Details" in line_text:
+                        in_transactions = True
+                        continue
+                    if "The Following Information Concerning This Account Is" in line_text:
+                        in_transactions = False
+                        continue
+                    if not in_transactions: continue
+                    
+                    # Look for date
+                    if re.match(r'^\d{1,2} [A-Z][a-z]{2} \d{4}', line_text):
+                        date_str = " ".join([w['text'] for w in line_w[:3]])
+                        current_date = datetime.strptime(date_str, "%d %b %Y")
+                        line_w = line_w[3:]
+                    
+                    if not current_date: continue
+                    
+                    # Find amounts
+                    amts = []
+                    for w in line_w:
+                        m = re.search(r'^[\d,]+\.\d{2}$', w['text'].replace('$', ''))
+                        if m:
+                            amts.append({'val': float(m.group(0).replace(',', '')), 'x0': w['x0']})
+                    
+                    if not amts: continue
+                    
+                    particulars = " ".join([w['text'] for w in line_w if not any(w['text'] == str(a['val']) or w['text'] == f"{a['val']:.2f}" for a in amts)])
+                    
+                    # Use X positions
+                    # Debit < 410, Credit 410-480, Balance > 480
+                    trans_amt = None
+                    for a in amts:
+                        if a['x0'] < 410: # Debit
+                            trans_amt = -a['val']
+                        elif a['x0'] < 480: # Credit
+                            trans_amt = a['val']
+                        else: # Balance
+                            prev_balance = a['val']
+                    
+                    if trans_amt is not None:
+                        transactions.append(Transaction(current_date, trans_amt, particulars.strip()))
+            
         return transactions
 
 class NABCreditCardParser(BaseParser):
@@ -158,13 +261,17 @@ class NABCreditCardParser(BaseParser):
                 if not text: continue
                 # Date processed Date transaction Details Amount
                 # 27/02/26 25/02/26 V4274 ASUPER2000VALEDESAOC 1.42
-                matches = re.findall(r'(\d{2}/\d{2}/\d{2})\s+\d{2}/\d{2}/\d{2}\s+V\d{4}\s+([\s\S]*?)\s+([\d,]+\.\d{2})', text)
-                for date_str, details, amount_str in matches:
+                matches = re.findall(r'(\d{2}/\d{2}/\d{2})\s+\d{2}/\d{2}/\d{2}\s+V\d{4}\s+([\s\S]*?)\s+([\d,]+\.\d{2})(CR)?', text)
+                for date_str, details, amount_str, cr in matches:
                     date = datetime.strptime(date_str, "%d/%m/%y")
                     amount = float(amount_str.replace(',', ''))
-                    # Credit card debits are positive in some systems, but QIF usually wants negative for expenses.
-                    # Sample QIF has T-190.59.
-                    transactions.append(Transaction(date, -amount, details))
+                    # Credit card debits (purchases) should be negative in QIF.
+                    # Payments (CR) should be positive.
+                    if cr:
+                        pass 
+                    else:
+                        amount = -amount
+                    transactions.append(Transaction(date, amount, details.strip()))
         return transactions
 
 class ANZCreditCardParser(BaseParser):
@@ -178,15 +285,14 @@ class ANZCreditCardParser(BaseParser):
                 for line in lines:
                     # Match standard transaction lines
                     # DateProc DateTrans [Card] Details Amount Balance
-                    match = re.search(r'(\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}/\d{4}\s+(?:\d{4}\s+)?([\s\S]*?)\s+\$([\d,]+\.\d{2})(?:\s+\$([\d,]+\.\d{2}))?(?:\s*(CR|C R))?', line)
+                    match = re.search(r'(\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}/\d{4}\s+(?:\d{4}\s+)?([\s\S]*?)\s+\$([\d,]+\.\d{2})\s*(CR|C R)?(?:\s+\$([\d,]+\.\d{2}))?(?:\s*(CR|C R))?', line)
                     if match:
-                        date_str, details, amount_str, balance_str, cr = match.groups()
+                        date_str, details, amount_str, amt_cr, balance_str, bal_cr = match.groups()
                         date = datetime.strptime(date_str, "%d/%m/%Y")
                         amount = float(amount_str.replace(',', ''))
                         
                         # If it's a payment, it's CR (Credit to the card account)
-                        # If it's a purchase, it's a debit from the account (positive in statement, but should be negative in QIF)
-                        if cr or "PAYMENT" in details:
+                        if amt_cr or "PAYMENT" in details:
                             pass # Keep positive
                         else:
                             amount = -amount
@@ -195,30 +301,18 @@ class ANZCreditCardParser(BaseParser):
                         continue
 
                     # Match fee lines that follow a transaction
-                    # Example: 05/10/2020 INCL OVERSEAS TXN FEE 0.09 AUD $8,974.24
-                    # Note: These lines have only ONE date (processed date)
                     match_fee = re.search(r'(\d{2}/\d{2}/\d{4})\s+(INCL OVERSEAS TXN FEE\s+([\d,]+\.\d{2})\s+AUD)', line)
                     if match_fee and transactions:
                         date_str, fee_details, fee_amount_str = match_fee.groups()
                         fee_amount = float(fee_amount_str.replace(',', ''))
-                        # For credit cards, fees are usually part of the previous transaction's total on the statement?
-                        # Wait, let's look at the ANZ statement again.
-                        # 05/10/2020 01/10/2020 2586 PAYPAL *PATREON MEMBER 4029357733 $3.02 $8,974.24
-                        # 05/10/2020 INCL OVERSEAS TXN FEE 0.09 AUD $8,974.24
-                        # The balance is the SAME ($8,974.24). This means the $3.02 ALREADY INCLUDES the $0.09 fee.
-                        # So we should split the $3.02 into $2.93 and $0.09 fee.
-                        
-                        # Update the base amount of the last transaction
-                        transactions[-1].amount += fee_amount # amount was negative, adding fee_amount (which should be treated as negative)
-                        # Actually if amount is -3.02 and fee is 0.09, we want base -2.93 and fee -0.09.
-                        # So base = -3.02 - (-0.09) = -2.93.
-                        # But wait, fee_amount is extracted as positive 0.09.
-                        
-                        transactions[-1].amount += fee_amount # -3.02 + 0.09 = -2.93
+                        # Fee is already included in the previous transaction's total on ANZ statement.
+                        # We just add a split but DO NOT change the total amount.
                         transactions[-1].add_split(fee_details, -fee_amount)
+                        # We also need to adjust the "base" part of the transaction if we want splits to sum up.
+                        # But Transaction.to_qif doesn't currently handle the base vs splits well.
+                        # For now, let's just NOT change the total amount to keep the sum correct.
                         continue
                     
-                    # Also match "INTEREST CHARGED" or other lines that might have slightly different format
                     if "INTEREST CHARGED" in line:
                         match_int = re.search(r'(\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}/\d{4}\s+([\s\S]*?)\s+\$([\d,]+\.\d{2})', line)
                         if match_int:
@@ -229,31 +323,50 @@ class ANZCreditCardParser(BaseParser):
 
         return transactions
 
+        return transactions
+
 class MacquarieBankAccParser(BaseParser):
     def parse(self):
         transactions = []
         with pdfplumber.open(self.filename) as pdf:
+            prev_balance = None
             current_year = datetime.now().year
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text: continue
-                # Date doesn't have year in transaction list, but "Jan 2021" header exists.
                 lines = text.split('\n')
                 current_month_year = None
                 for line in lines:
+                    line = line.strip()
                     month_match = re.search(r'([A-Z][a-z]{2}) (\d{4})', line)
                     if month_match:
                         current_month_year = month_match.groups()
                     
+                    if "Opening balance" in line:
+                        match = re.search(r'Opening balance\s+([\d,]+\.\d{2})', line)
+                        if match:
+                             prev_balance = float(match.group(1).replace(',', ''))
+                        continue
+
                     trans_match = re.match(r'^(\d{2} [A-Z][a-z]{2})\s+([\s\S]*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})(CR)?', line)
                     if trans_match and current_month_year:
                         day_month, details, amt1, amt2, cr = trans_match.groups()
                         date_str = f"{day_month} {current_month_year[1]}"
                         date = datetime.strptime(date_str, "%d %b %Y")
                         amount = float(amt1.replace(',', ''))
-                        if not cr: # If not CR, it might be a debit
-                             amount = -amount
-                        transactions.append(Transaction(date, amount, details))
+                        balance = float(amt2.replace(',', ''))
+                        
+                        if prev_balance is not None:
+                             if abs((prev_balance + amount) - balance) < 0.01:
+                                 pass
+                             elif abs((prev_balance - amount) - balance) < 0.01:
+                                 amount = -amount
+                             else:
+                                 if abs((prev_balance - amount) - balance) < abs((prev_balance + amount) - balance):
+                                     amount = -amount
+                        
+                        prev_balance = balance
+                        transactions.append(Transaction(date, amount, details.strip()))
         return transactions
 
 def get_parser(bank, account_type, filename):
