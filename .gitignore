@@ -6,3 +6,5 @@
 /*.csv
 /*.qif
 /test_outputs/
+__pycache__/
+/.junie/

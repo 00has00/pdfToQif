@@ -41,8 +41,8 @@ python main.py <bank> <account_type> -i <input_files...> -o <output_file> [--for
 
 ### Arguments
 
-- `bank`: The name of the bank (e.g., `ANZ`, `NAB`, `Macquarie`).
-- `account_type`: The type of account (e.g., `CreditCard`, `BankAcc`).
+- `bank` *(optional)*: The name of the bank (e.g., `ANZ`, `NAB`, `Macquarie`). If omitted, it is inferred from the input filename (e.g. `NAB-BankAcc-...pdf`).
+- `account_type` *(optional)*: The type of account (e.g., `CreditCard`, `BankAcc`). If omitted, it is inferred from the input filename.
 - `-i, --input`: One or more paths to the PDF statement files.
 - `-o, --output`: The path for the output file (default: `transactions.qif`).
 - `--format`: (Optional) Explicitly set the output format to `qif` or `csv`. If omitted, the format is inferred from the output file extension.

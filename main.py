@@ -3,7 +3,7 @@ import sys
 import csv
 import io
 import os
-from parsers import get_parser, Transaction
+from parsers import get_parser, Transaction, infer_bank_and_account
 
 def validate_path(path, must_exist=False):
     """
@@ -67,8 +67,12 @@ class CSVGenerator:
 
 def main():
     parser = argparse.ArgumentParser(description='Convert bank statements in PDF to QIF or CSV.')
-    parser.add_argument('bank', help='Bank name (e.g., ANZ, NAB, Macquarie)')
-    parser.add_argument('account_type', help='Account type (e.g., CreditCard, BankAcc)')
+    parser.add_argument('bank', nargs='?', default=None,
+                        help='Bank name (e.g., ANZ, NAB, Macquarie). '
+                             'If omitted, inferred from the input filename.')
+    parser.add_argument('account_type', nargs='?', default=None,
+                        help='Account type (e.g., CreditCard, BankAcc). '
+                             'If omitted, inferred from the input filename.')
     parser.add_argument('-i', '--input', nargs='+', required=True, dest='statement_filenames', help='Path to one or more PDF statement files')
     parser.add_argument('-o', '--output', default='transactions.qif', dest='output_filename', help='Output filename (default: transactions.qif)')
     parser.add_argument('--format', choices=['qif', 'csv'], help='Output format (qif or csv). If not specified, inferred from output_filename extension.')
@@ -91,16 +95,31 @@ def main():
         else:
             fmt = 'qif'
 
+    # Resolve bank / account_type once, falling back to filename inference
+    # using the FIRST input file (all inputs must share the same kind).
+    resolved_bank = args.bank
+    resolved_acc = args.account_type
+    if not resolved_bank or not resolved_acc:
+        inferred_bank, inferred_acc = infer_bank_and_account(input_paths[0])
+        resolved_bank = resolved_bank or inferred_bank
+        resolved_acc = resolved_acc or inferred_acc
+    if not resolved_bank or not resolved_acc:
+        print("Error: Could not determine bank and/or account type. "
+              "Pass them explicitly or use a filename like "
+              "'NAB-BankAcc-...pdf'.")
+        sys.exit(1)
+
     if fmt == 'csv':
         generator = CSVGenerator()
     else:
-        generator = QIFGenerator(args.account_type)
+        generator = QIFGenerator(resolved_acc)
 
     total_transactions = 0
     for filename in input_paths:
-        pdf_parser = get_parser(args.bank, args.account_type, filename)
+        pdf_parser = get_parser(resolved_bank, resolved_acc, filename)
         if not pdf_parser:
-            print(f"Error: Unsupported bank or account type: {args.bank} - {args.account_type}")
+            print(f"Error: Unsupported bank or account type: "
+                  f"{resolved_bank} - {resolved_acc}")
             sys.exit(1)
 
         try:

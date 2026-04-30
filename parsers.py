@@ -1,3 +1,4 @@
+import os
 import pdfplumber
 import re
 from datetime import datetime
@@ -380,3 +381,158 @@ def get_parser(bank, account_type, filename):
     if "macquarie" in bank:
         return MacquarieBankAccParser(filename)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Dynamic statement metadata discovery.
+#
+# Rather than hard-coding a list of sample statements (with their bank,
+# account type, and opening/closing balances) anywhere in the codebase, the
+# helpers below derive that metadata directly from the PDF filename and
+# contents. This means new sample statements can simply be dropped into
+# `sample-statements/` and they will be picked up automatically by the
+# tests and any other consumers (CLI auto-detection, tooling, etc.).
+# ---------------------------------------------------------------------------
+
+# Known banks and account types we can dispatch a parser for.
+_KNOWN_BANKS = ("NAB", "ANZ", "Macquarie")
+_KNOWN_ACCOUNTS = {
+    "creditcard": "CreditCard",
+    "credit": "CreditCard",
+    "cc": "CreditCard",
+    "bankacc": "BankAcc",
+    "bank": "BankAcc",
+    "savings": "BankAcc",
+}
+
+
+def infer_bank_and_account(filename):
+    """Infer (bank, account_type) from a statement's filename.
+
+    Recognises tokens separated by `-`, `_` or whitespace. Bank matching is
+    fuzzy (e.g. 'Macacquarie' -> 'Macquarie') and case-insensitive. Returns
+    (None, None) if either component cannot be determined.
+    """
+    base = os.path.basename(filename)
+    stem = os.path.splitext(base)[0]
+    tokens = re.split(r"[-_\s]+", stem)
+    lower_tokens = [t.lower() for t in tokens]
+
+    bank = None
+    for known in _KNOWN_BANKS:
+        kl = known.lower()
+        for t in lower_tokens:
+            # Direct/substring match, or fuzzy: token starts with the same
+            # first 3 chars AND shares >= 60% of characters (handles typos
+            # like 'Macacquarie' for 'Macquarie').
+            if kl in t or t in kl:
+                bank = known
+                break
+            if len(t) >= 3 and len(kl) >= 4 and t[:3] == kl[:3]:
+                shared = sum(1 for c in kl if c in t)
+                if shared / len(kl) >= 0.75:
+                    bank = known
+                    break
+        if bank:
+            break
+
+    account = None
+    for t in lower_tokens:
+        if t in _KNOWN_ACCOUNTS:
+            account = _KNOWN_ACCOUNTS[t]
+            break
+    if account is None:
+        joined = stem.lower().replace("-", "").replace("_", "")
+        for key, val in _KNOWN_ACCOUNTS.items():
+            if key in joined:
+                account = val
+                break
+
+    return bank, account
+
+
+# Per-(bank, account) regex patterns for opening / closing balance extraction.
+# Each pattern captures a single floating-point amount; a `sign` of -1 means
+# the balance represents debt (e.g. credit-card statements show a positive
+# "amount owing" that we model internally as a negative balance).
+_BALANCE_PATTERNS = {
+    ("NAB", "BankAcc"): {
+        "opening": (r'Opening balance\s*\$?([\d,]+\.\d{2})', 1),
+        "closing": (r'Closing balance\s*\$?([\d,]+\.\d{2})', 1),
+    },
+    ("NAB", "CreditCard"): {
+        # NAB CC statements render text without spaces: "Openingbalance $4,651.30 DR"
+        "opening": (r'Opening\s*balance\s*\$?([\d,]+\.\d{2})\s*DR', -1),
+        "closing": (r'Closing\s*balance\s*\$?([\d,]+\.\d{2})\s*DR', -1),
+    },
+    ("ANZ", "CreditCard"): {
+        "opening": (r'Opening\s+Balance\s*\$?([\d,]+\.\d{2})', -1),
+        "closing": (r'Closing\s+Balance\s*\$?([\d,]+\.\d{2})', -1),
+    },
+    ("Macquarie", "BankAcc"): {
+        "opening": (r'Opening balance\s+([\d,]+\.\d{2})\s*CR', 1),
+        "closing": (r'Closing balance\s+([\d,]+\.\d{2})\s*CR', 1),
+    },
+}
+
+
+def _extract_full_text(filename):
+    with pdfplumber.open(filename) as pdf:
+        return "\n".join((p.extract_text() or "") for p in pdf.pages)
+
+
+def extract_balances(filename, bank, account_type):
+    """Return (opening, closing) balances parsed from a statement PDF.
+
+    Raises ValueError if either balance cannot be located, so callers
+    can fail fast rather than silently producing wrong test ground truth.
+    """
+    key = (bank, account_type)
+    patterns = _BALANCE_PATTERNS.get(key)
+    if not patterns:
+        raise ValueError(f"No balance-extraction patterns registered for {key}")
+
+    text = _extract_full_text(filename)
+    result = {}
+    for which, (regex, sign) in patterns.items():
+        m = re.search(regex, text)
+        if not m:
+            raise ValueError(
+                f"Could not extract {which} balance from {filename} using {regex!r}"
+            )
+        result[which] = sign * float(m.group(1).replace(",", ""))
+    return result["opening"], result["closing"]
+
+
+def discover_samples(directory="sample-statements"):
+    """Enumerate every sample statement under `directory` and return a list of
+    metadata dicts: name, bank, acc, file, opening, closing.
+
+    The list is rebuilt from disk + PDF contents on every call, so dropping a
+    new statement into the directory is enough — no code or fixture changes
+    required.
+    """
+    samples = []
+    if not os.path.isdir(directory):
+        return samples
+    for entry in sorted(os.listdir(directory)):
+        if not entry.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(directory, entry)
+        bank, acc = infer_bank_and_account(entry)
+        if not bank or not acc:
+            # Unknown statement layout – skip rather than guess.
+            continue
+        try:
+            opening, closing = extract_balances(path, bank, acc)
+        except ValueError:
+            continue
+        samples.append({
+            "name": f"{bank}_{acc}",
+            "bank": bank,
+            "acc": acc,
+            "file": path,
+            "opening": opening,
+            "closing": closing,
+        })
+    return samples
