@@ -45,13 +45,39 @@ python main.py <bank> <account_type> -i <input_files...> -o <output_file> [--for
 - `account_type` *(optional)*: The type of account (e.g., `CreditCard`, `BankAcc`). If omitted, it is inferred from the input filename.
 - `-i, --input`: One or more paths to the PDF statement files.
 - `-o, --output`: The path for the output file (default: `transactions.qif`).
-- `--format`: (Optional) Explicitly set the output format to `qif` or `csv`. If omitted, the format is inferred from the output file extension.
+- `--format`: *(optional)* Explicitly set the output format to `qif` or `csv`. If omitted, the format is inferred from the output file extension.
+- `--skip-verify`: *(optional)* Skip the post-extraction verification stage that runs before any output file is written. Not recommended — only useful for debugging unsupported statement layouts. See *Extraction verification* below.
+
+### Extraction verification
+
+By default, after parsing each input PDF and **before** writing any QIF or CSV file, the program runs a set of sanity checks on the extracted transactions. If any check fails, the program prints the problems, exits with status `1`, and **no output file is left on disk** (any half-written file is cleaned up).
+
+Checks performed:
+
+1. **Non-empty extraction** — refuse to write a file for a statement that produced zero transactions.
+2. **Balance equation** — `opening + Σ(transactions) == closing` (within $0.01), using opening/closing balances extracted from the PDF.
+3. **Field integrity** — every transaction has a date, a non-empty payee, and a finite numeric amount.
+4. **Plausible dates** — transaction year is between 1990 and 2100.
+5. **Splits magnitude** — `|sum(splits)| ≤ |parent amount|`.
+6. **Duplicate detection** — flags suspicious clusters of `(date, payee, amount)` repeats.
+
+Pass `--skip-verify` to bypass these checks (not recommended).
 
 ### Examples
 
 **Convert a single ANZ Credit Card statement to QIF:**
 ```bash
 python main.py ANZ CreditCard -i statement.pdf -o transactions.qif
+```
+
+**Auto-detect bank and account type from the filename:**
+```bash
+python main.py -i NAB-BankAcc-statement.pdf -o transactions.qif
+```
+
+**Bypass extraction verification (debugging only):**
+```bash
+python main.py -i statement.pdf -o transactions.qif --skip-verify
 ```
 
 **Convert multiple NAB Bank statements to a single CSV:**
