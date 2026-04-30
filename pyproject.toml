@@ -1,5 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pdftoqif"
 version = "0.1.0"
-requires-python = ">=3.13"
-dependencies = []
+description = "Convert Australian bank/credit-card PDF statements (NAB, ANZ, Macquarie) to QIF or CSV, with extraction verification."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Hugo Steiner" },
+]
+keywords = ["pdf", "qif", "csv", "bank", "statement", "finance", "nab", "anz", "macquarie"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
+
+# Runtime dependencies. Only `pdfplumber` is imported from third-party code;
+# everything else (argparse, csv, io, os, re, sys, datetime, subprocess,
+# tempfile, unittest) ships with the Python standard library.
+dependencies = [
+    "pdfplumber>=0.10",
+]
+
+[project.optional-dependencies]
+# Test extras. The suite itself uses stdlib `unittest`, but pytest is a nicer
+# runner and is what most contributors will reach for.
+test = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+# Installs a `pdftoqif` console entry point that calls main.main().
+pdftoqif = "main:main"
+
+[tool.setuptools]
+# This project is a flat layout of top-level modules rather than a package.
+py-modules = ["main", "parsers"]
