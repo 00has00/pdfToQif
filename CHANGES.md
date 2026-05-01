@@ -4,6 +4,49 @@ A chronological log of commits in this repository, newest first. Each entry
 summarises the user-visible behaviour change and the key implementation
 points.
 
+## QIF specification compliance and ANZ Dec-2024 sign fix
+
+Brings generated QIF output into conformance with the **W3C QIF
+specification** (https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm),
+also pointed to from `sample-qif-files/QIF Format Definition.txt`.
+
+Generator changes (`main.py`, `parsers.py`):
+
+- `QIFGenerator` now emits **CRLF** line terminators (matching the
+  bundled `sample-qif-files/Transactions.qif`) and exactly one
+  `!Type:<account>` header on the first line.
+- The `<account>` value is normalised to a spec-legal token
+  (`Bank`, `CCard`, `Cash`, `Oth A`, `Oth L`, `Invst`).
+- `Transaction.to_qif()` sanitises `P`/`M`/`N`/`S` field values by
+  stripping CR/LF/TAB/control characters so each field stays on a
+  single line.
+- When splits exist, the generator auto-balances any rounding remainder
+  so `Σ$ == T` exactly, as required by the spec.
+
+New validator and pre-write enforcement:
+
+- `validate_qif_compliance(text)` returns a list of spec violations
+  covering: header presence and uniqueness, spec-legal `!Type` value,
+  legal field tags on every line, `^` terminator placement, splits
+  summing to the record total, and trailing-record termination.
+- `main.py` now runs the validator on the rendered QIF before writing
+  and refuses to leave a non-compliant file on disk.
+
+Tests (`test_suite.py`):
+
+- New `TestQIFSpecCompliance` class with 16 tests covering the
+  validator (positive + negative cases), single-`!Type:` header,
+  spec-legal type values, CRLF endings, legal tags on every line,
+  caret-on-its-own-line termination, split-sum = total invariant,
+  no embedded control chars, and a generator → re-parse round-trip
+  asserting identical transaction count and amount sum on every
+  discovered sample.
+
+Documentation:
+
+- README adds a **QIF Specification Compliance** section citing the
+  W3C source URL and listing the seven enforced spec rules.
+
 ## 6a45489 — Verify extraction before writing QIF/CSV output
 
 Adds a verification stage between parsing and writing so the program never

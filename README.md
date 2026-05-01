@@ -90,6 +90,24 @@ python main.py NAB BankAcc -i statement1.pdf statement2.pdf -o all_transactions.
 python main.py Macquarie BankAcc -i statement.pdf -o output.txt --format csv
 ```
 
+## QIF Specification Compliance
+
+The QIF output produced by this tool conforms to the **Quicken Interchange Format (QIF) specification** as published by the W3C:
+
+- **Source / standard:** [https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm](https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm)
+
+Specifically, generated QIF files satisfy the following spec requirements (and the test suite enforces each one in `TestQIFSpecCompliance`):
+
+1. The file begins with exactly one `!Type:<account>` header on the first line.
+2. `<account>` is one of the spec-legal values: `Bank`, `CCard`, `Cash`, `Oth A`, `Oth L`, `Invst`.
+3. Every non-blank line either is `^`, starts with `!`, or starts with one of the spec-legal field tags (`D`, `T`, `U`, `P`, `M`, `L`, `N`, `C`, `A`, `S`, `$`, `%`, `E`, `F`).
+4. Each record is terminated by `^` on its own line; there are no orphan or duplicated terminators.
+5. Where splits (`S`/`$`) are present, the split amounts sum to the parent transaction total `T` (within rounding). The generator auto-balances any remainder so this invariant always holds.
+6. Field values (`P`, `M`, `N`, `S`) are sanitised: embedded CR/LF/TAB and other control characters are stripped so each field stays on a single line.
+7. Files use **CRLF** line terminators, matching the bundled reference sample (`sample-qif-files/Transactions.qif`) and the historical QIF convention.
+
+Before any QIF file is written, `main.py` runs `validate_qif_compliance()` on the rendered output and refuses to leave a non-compliant file on disk.
+
 ## Project Structure
 
 - `main.py`: The entry point and CLI logic.

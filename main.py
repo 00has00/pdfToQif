@@ -37,18 +37,146 @@ def validate_path(path, must_exist=False):
     return abs_path
 
 class QIFGenerator:
+    """Generate a QIF file compliant with the QIF specification.
+
+    Spec reference:
+      https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm
+
+    Compliance highlights:
+      - Single `!Type:<account>` header on the first line, with `<account>`
+        drawn from the spec's allowed set (`Bank`, `CCard`, `Cash`, `Oth A`,
+        `Oth L`, `Invst`).
+      - Each record is terminated by `^` on its own line.
+      - CRLF line endings, matching the bundled reference sample and
+        historical QIF files.
+      - Field values are sanitised so embedded line breaks/tabs/control
+        characters never break the line-oriented record structure.
+      - Where splits are present, their amounts sum to the parent
+        transaction total (enforced in `Transaction.to_qif`).
+    """
+
+    LINE_ENDING = "\r\n"
+    _SPEC_TYPE_MAP = {
+        "creditcard": "CCard",
+        "credit": "CCard",
+        "ccard": "CCard",
+        "cash": "Cash",
+        "invst": "Invst",
+        "investment": "Invst",
+        "otha": "Oth A",
+        "othl": "Oth L",
+    }
+
     def __init__(self, account_type="Bank"):
-        self.account_type = "CCard" if "credit" in account_type.lower() else "Bank"
+        self.account_type = self._normalise_type(account_type)
         self.transactions = []
+
+    @classmethod
+    def _normalise_type(cls, account_type):
+        key = (account_type or "").lower().replace(" ", "").replace("-", "")
+        return cls._SPEC_TYPE_MAP.get(key, "Bank")
 
     def add_transactions(self, transactions):
         self.transactions.extend(transactions)
 
     def generate(self):
-        output = [f"!Type:{self.account_type}"]
+        # Header is emitted exactly once on the first line.
+        parts = [f"!Type:{self.account_type}"]
         for t in self.transactions:
-            output.append(t.to_qif())
-        return "\n".join(output) + "\n"
+            # Each record is already a multi-line block ending in `^`.
+            # We rejoin its internal LFs to CRLF here so the whole file
+            # uses consistent CRLF terminators per the spec.
+            parts.append(t.to_qif().replace("\n", self.LINE_ENDING))
+        return self.LINE_ENDING.join(parts) + self.LINE_ENDING
+
+# QIF spec-legal account types and field tags
+# (https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm).
+QIF_SPEC_TYPES = {"Bank", "CCard", "Cash", "Oth A", "Oth L", "Invst"}
+QIF_FIELD_TAGS = set("DTUPMLNCAS$%EF")  # leading char of any non-`^`/`!` line
+
+
+def validate_qif_compliance(text):
+    """Validate that `text` complies with the QIF specification.
+
+    Returns a list of human-readable problem strings (empty = compliant).
+    Reference: https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm
+    """
+    problems = []
+    if not text:
+        return ["Empty QIF output."]
+
+    # The file must start with exactly one !Type: header.
+    raw_lines = text.split("\r\n") if "\r\n" in text else text.split("\n")
+    # Drop trailing empty line(s) introduced by the final terminator.
+    while raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
+    if not raw_lines:
+        return ["QIF output contains no lines."]
+
+    if not raw_lines[0].startswith("!Type:"):
+        problems.append("First line must be a `!Type:` header.")
+    else:
+        type_value = raw_lines[0][len("!Type:"):].strip()
+        if type_value not in QIF_SPEC_TYPES:
+            problems.append(
+                f"`!Type:{type_value}` is not a spec-legal account type "
+                f"(allowed: {sorted(QIF_SPEC_TYPES)}).")
+    if sum(1 for ln in raw_lines if ln.startswith("!Type:")) != 1:
+        problems.append("QIF file must contain exactly one `!Type:` header.")
+
+    # Per-line tag validation and record terminator placement.
+    in_record = False
+    has_date = has_total = False
+    record_split_sum = 0.0
+    record_total = None
+    for idx, ln in enumerate(raw_lines[1:], start=2):
+        if ln == "":
+            continue
+        if ln.startswith("!"):
+            continue  # other section headers are spec-legal
+        if ln == "^":
+            if not in_record:
+                problems.append(f"Line {idx}: orphan `^` terminator.")
+            else:
+                if not has_date:
+                    problems.append(f"Line {idx}: record missing `D` (date).")
+                if not has_total:
+                    problems.append(f"Line {idx}: record missing `T` (total).")
+                if record_total is not None and record_split_sum != 0.0:
+                    if abs(record_split_sum - record_total) > 0.01:
+                        problems.append(
+                            f"Line {idx}: split amounts sum to "
+                            f"{record_split_sum:.2f} but record total is "
+                            f"{record_total:.2f}.")
+            in_record = False
+            has_date = has_total = False
+            record_split_sum = 0.0
+            record_total = None
+            continue
+        tag = ln[0]
+        if tag not in QIF_FIELD_TAGS:
+            problems.append(f"Line {idx}: illegal QIF tag {tag!r} in {ln!r}.")
+            continue
+        in_record = True
+        if tag == "D":
+            has_date = True
+        elif tag == "T":
+            has_total = True
+            try:
+                record_total = float(ln[1:].replace(",", ""))
+            except ValueError:
+                problems.append(f"Line {idx}: non-numeric `T` amount: {ln!r}.")
+        elif tag == "$":
+            try:
+                record_split_sum += float(ln[1:].replace(",", ""))
+            except ValueError:
+                problems.append(f"Line {idx}: non-numeric `$` split: {ln!r}.")
+
+    if in_record:
+        problems.append("Final record is not terminated by `^`.")
+
+    return problems
+
 
 class CSVGenerator:
     def __init__(self):
@@ -251,8 +379,19 @@ def main():
     # verified. If anything above failed we exited before reaching here,
     # so no partial/incorrect QIF or CSV is ever left on disk.
     try:
+        rendered = generator.generate()
+        # For QIF output, additionally validate that the rendered text
+        # complies with the QIF specification before persisting it.
+        if fmt == 'qif' and not args.skip_verify:
+            qif_problems = validate_qif_compliance(rendered)
+            if qif_problems:
+                print("QIF spec compliance check FAILED:")
+                for p in qif_problems:
+                    print(f"  - {p}")
+                print("No output file was written.")
+                sys.exit(1)
         with open(output_path, 'w', newline='', encoding='utf-8') as f:
-            f.write(generator.generate())
+            f.write(rendered)
     except Exception as e:
         # Defensive cleanup: if writing started and failed, remove the
         # half-written file so the user is never left with bad output.

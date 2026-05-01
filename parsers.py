@@ -15,17 +15,46 @@ class Transaction:
     def add_split(self, memo, amount):
         self.splits.append((memo, amount))
 
+    @staticmethod
+    def _sanitise_field(value):
+        """Strip control chars (CR/LF/TAB) from a QIF field value.
+
+        Per the QIF spec (https://www.w3.org/2000/10/swap/pim/qif-doc/QIF-doc.htm)
+        each field occupies a single line; embedded line breaks would corrupt
+        the file. We replace control characters with a single space and
+        collapse runs of whitespace.
+        """
+        if value is None:
+            return ""
+        text = str(value)
+        text = re.sub(r"[\r\n\t\x00-\x1f\x7f]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     def to_qif(self):
         date_str = self.date.strftime("%d/%m/%y")
         # Ensure amount is not -0.00
         amount_val = self.amount if abs(self.amount) > 0.005 else 0.0
-        lines = [f"D{date_str}", f"T{amount_val:.2f}", f"P{self.payee}"]
-        if self.num is not None: lines.append(f"N{self.num}")
-        if self.memo: lines.append(f"M{self.memo}")
-        
-        for s_memo, s_amount in self.splits:
-            lines.append(f"S{s_memo}")
-            lines.append(f"${s_amount:.2f}")
+        lines = [f"D{date_str}", f"T{amount_val:.2f}",
+                 f"P{self._sanitise_field(self.payee)}"]
+        if self.num is not None:
+            lines.append(f"N{self._sanitise_field(self.num)}")
+        if self.memo:
+            lines.append(f"M{self._sanitise_field(self.memo)}")
+
+        # If splits exist, the QIF spec requires Σ$ == T. If they don't sum
+        # to the parent total we add a balancing split so the record is
+        # spec-compliant rather than silently mis-allocating money.
+        if self.splits:
+            split_sum = 0.0
+            for s_memo, s_amount in self.splits:
+                lines.append(f"S{self._sanitise_field(s_memo)}")
+                lines.append(f"${s_amount:.2f}")
+                split_sum += s_amount
+            remainder = amount_val - split_sum
+            if abs(remainder) > 0.005:
+                lines.append(f"S{self._sanitise_field(self.payee)}")
+                lines.append(f"${remainder:.2f}")
 
         lines.append("^")
         return "\n".join(lines)
@@ -292,8 +321,13 @@ class ANZCreditCardParser(BaseParser):
                         date = datetime.strptime(date_str, "%d/%m/%Y")
                         amount = float(amount_str.replace(',', ''))
                         
-                        # If it's a payment, it's CR (Credit to the card account)
-                        if amt_cr or "PAYMENT" in details:
+                        # CR-marked amounts are credits to the card account
+                        # (payments, refunds). All other amounts are debits
+                        # (purchases) and must be negated. We deliberately do
+                        # NOT use a "PAYMENT" substring fallback because
+                        # legitimate purchases (e.g. "TELSTRA BILL PAYMENT")
+                        # contain the word PAYMENT in the merchant name.
+                        if amt_cr:
                             pass # Keep positive
                         else:
                             amount = -amount
@@ -528,7 +562,7 @@ def discover_samples(directory="sample-statements"):
         except ValueError:
             continue
         samples.append({
-            "name": f"{bank}_{acc}",
+            "name": os.path.splitext(entry)[0],
             "bank": bank,
             "acc": acc,
             "file": path,
